@@ -1,0 +1,281 @@
+Description: Workshop EMR
+
+Parameters:
+
+  pNameBucket:
+    Description: Nombre bucket
+    Type: String
+    Default: smartfarming
+    
+  pNameStream: 
+    Description: Nombre de stream
+    Type: String
+    Default: StreamFarming
+    
+  pNameRule:
+    Description: Nombre de regla
+    Type: String
+    Default: RuleSmartFarming
+    
+Resources:
+
+  rS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join [ -, [ !Ref pNameBucket, !Ref AWS::AccountId ] ]
+    
+  rStreamIoT:  
+    Type: AWS::Kinesis::Stream 
+    Properties: 
+        Name: !Ref pNameStream
+        RetentionPeriodHours: 24 
+        ShardCount: 1
+        
+  rTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Ref pNameRule
+      TopicRulePayload:
+        RuleDisabled: 'false'
+        Sql: SELECT * FROM 'sensor-iot/farming' WHERE humidity > 75
+        Actions:
+        - Kinesis:
+            PartitionKey: ${newuuid()}
+            RoleArn: !GetAtt rRoleIoT.Arn
+            StreamName: !Ref pNameStream
+        - Firehose:
+            DeliveryStreamName: !Ref rFirehose
+            RoleArn: !GetAtt rRoleIoT.Arn
+            Separator: ','
+            
+  rRoleIoT:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RoleIoTLab
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - iot.amazonaws.com
+          Action:
+          - sts:AssumeRole
+          
+  rPolicyIoT:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: root
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 'kinesis:PutRecord'
+            Resource: !GetAtt rStreamIoT.Arn
+          - Effect: Allow
+            Action: 'firehose:PutRecord'
+            Resource: !GetAtt rFirehose.Arn
+      Roles:
+        - !Ref rRoleIoT
+
+  rFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: FirehoseSmartFarming
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Join 
+          - ''
+          - - 'arn:aws:s3:::'
+            - !Ref rS3Bucket
+        BufferingHints:
+          IntervalInSeconds: '60'
+          SizeInMBs: '1'
+        CompressionFormat: UNCOMPRESSED
+        Prefix: data/input/firehose/sensor/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}
+        ErrorOutputPrefix: data/input/firehose/error
+        RoleARN: !GetAtt rFirehoseRole.Arn
+        
+  rFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+                
+  rDeliveryPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: firehose_delivery_policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource:
+              - !Join 
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref rS3Bucket
+              - !Join 
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref rS3Bucket
+                  - '*'
+      Roles:
+        - !Ref rFirehoseRole
+        
+  rDynamoDBTable: 
+    Type: AWS::DynamoDB::Table
+    Properties: 
+        TableName: SensorSmartFarming
+        AttributeDefinitions: 
+        - 
+          AttributeName: "id"
+          AttributeType: "S"
+        KeySchema: 
+        - 
+          AttributeName: "id"
+          KeyType: "HASH"
+        BillingMode : PAY_PER_REQUEST
+        
+  rSnsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties: 
+      TopicName: TopicSmartFarming
+      DisplayName: Dispositivo ha superado el umbral
+      
+  rSubscription:
+    Type: 'AWS::SNS::Subscription'
+    DependsOn: rSnsTopic
+    Properties:
+      TopicArn: !Ref rSnsTopic
+      Endpoint: TU_CORREO #se debe cambiar por el correo a usar
+      Protocol: email
+      
+  rFunctionLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: AlertFarmingRealtime
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Runtime: python3.8
+      Timeout: 10
+      Environment:
+        Variables:
+          table_dynamo: !Ref rDynamoDBTable
+          sns_topic: !Ref rSnsTopic  
+      Role: !GetAtt rLambdaRole.Arn
+      Code:
+        ZipFile: |
+            import base64
+            import json
+            import boto3
+            import time
+            import os
+            from datetime import datetime, timedelta
+            
+            sns = boto3.client("sns")
+            dynamo = boto3.resource('dynamodb')
+            
+            def lambda_handler(event, context):
+            
+            	item = None
+            	table = dynamo.Table(os.environ['table_dynamo'])
+            	
+            	decoded_record_data = [base64.b64decode(record['kinesis']['data']) for record in event['Records']]
+            	deserialized_data = [json.loads(decoded_record) for decoded_record in decoded_record_data]
+            	
+            	with table.batch_writer() as batch_writer:
+            		for item in deserialized_data:
+            			
+            			id = item['id']
+            			read_date = item['read_date']
+            			device = item['device']
+            			humidity = item['humidity']
+            			temperature = item['temperature']
+            			date_convert = str((datetime.today() - timedelta(hours = 5, minutes = 0)).strftime("%Y-%m-%d %H:%M:%S"))
+            			
+            			batch_writer.put_item(                        
+            				Item = {
+            							'id': id,
+            							'read_date': str(date_convert),
+            							'device': device,
+            							'humidity' : humidity,
+            							'temperature' : temperature
+            						}
+            			)
+            			
+            			if humidity > 89:
+            				sns.publish(
+            					TopicArn = os.environ['sns_topic'],    
+            					Subject = 'Alerta : Umbral de sensor superado',
+            					Message = 'El dispositivo : ' + device + " ha detectado que la humedad ha llegado a " + str(humidity) + " (Fecha evento: " + date_convert + ")"
+            				)
+            				
+  rLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+            - sts:AssumeRole
+        Path: "/"
+        Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - dynamodb:BatchWriteItem
+              - dynamodb:PutItem
+              Resource: 
+              - !GetAtt rDynamoDBTable.Arn
+            - Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:CreateLogGroup
+              Resource: 
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+            - Effect: Allow
+              Action:
+              - kinesis:DescribeStream
+              - kinesis:GetShardIterator
+              - kinesis:GetRecords
+              Resource: 
+              - !GetAtt rStreamIoT.Arn
+            - Effect: Allow
+              Action:
+              - sns:Publish
+              Resource: 
+              - !Ref rSnsTopic
+              
+  rTriggerLambdaKinesis: 
+      Type: AWS::Lambda::EventSourceMapping
+      DependsOn: rFunctionLambda
+      Properties: 
+        EventSourceArn: !GetAtt rStreamIoT.Arn
+        FunctionName: AlertFarmingRealtime
+        StartingPosition: "LATEST"
+        BatchSize: 100
+        MaximumBatchingWindowInSeconds: 0
